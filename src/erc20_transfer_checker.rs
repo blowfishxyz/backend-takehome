@@ -58,7 +58,7 @@ impl EvmTransactionChecker for Erc20TransferChecker {
     }
 }
 
-/// If the method call is an `Approve` and the approved amount is maximum (2^256 - 1),
+/// If the method call is an `Approve` or `Permit` and the approved amount is maximum (2^256 - 1),
 /// it generates a warning indicating that the spender can withdraw any amount at any time.
 fn check_erc20_maximum_allowance(data: &str) -> anyhow::Result<Option<String>> {
     let data_bytes = hex::decode(data)
@@ -69,11 +69,14 @@ fn check_erc20_maximum_allowance(data: &str) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
 
+    // Assume for now that the method is the first 4 bytes of the data
     let method = &data_bytes[0..4];
     let method_vec = method.to_vec();
     let erc20_method = ERC20Method::from(method_vec);
 
     if erc20_method == ERC20Method::Approve && data_bytes.len() >= 36 {
+        // Approve method signature is 4 bytes, spender is 20 bytes, value is 32 bytes
+        // Therefore, use byterange 36 to 68
         let approved_amount = &data_bytes[36..68];
         let max_allowance = [255u8; 32];
 
@@ -82,6 +85,21 @@ fn check_erc20_maximum_allowance(data: &str) -> anyhow::Result<Option<String>> {
             return Ok(Some(warning));
         }
     }
+
+    if erc20_method == ERC20Method::Permit && data_bytes.len() >= 100 {
+        // Permit method signature is 4 bytes, owner is 20 bytes, spender is 20 bytes, value is 32 bytes
+        // Therefore, use byterange 44 to 76
+        let approved_amount = &data_bytes[44..76];
+        let max_allowance = [255u8; 32];
+
+        println!("approved_amount: {:?}", approved_amount);
+        println!("max_allowance: {:?}", max_allowance);
+    
+        if approved_amount == &max_allowance[..] {
+            let warning = "ERC20 maximum allowance given via Permit. The spender can withdraw any amount at any time.".to_string();
+            return Ok(Some(warning));
+        }
+    }    
 
     Ok(None)
 }
@@ -212,11 +230,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn it_should_warn_if_max_allowance_given() -> anyhow::Result<()> {
+    async fn it_should_warn_if_max_allowance_given_approve() -> anyhow::Result<()> {
+        // Works for approve
         let transaction = EvmTransactionObject {
             from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
             to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()),
             data: Some("0x095ea7b30000000000000000000000006b175474e89094c44da98b954eedeac495271d0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()),
+            value: Some("0".to_string()),
+            gas: None,
+        };
+
+        let context = EvmTransactionCheckerContext {
+            transaction: &transaction,
+        };
+        let checker = Erc20TransferChecker {};
+        let result = checker.run(&context).await?;
+        
+        assert!(!result.warnings.is_empty(), "warning on ERC20 transfer");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_should_warn_if_max_allowance_given_permit() -> anyhow::Result<()> {
+        // Works for permit
+        let method_signature = "d5e08e95"; // permit method signature
+        let owner = "6b175474e89094c44da98b954eedeac495271d0f";
+        let spender = "d8da6bf26964af9d7eed9e03e53415d37aa96045";
+        let value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; // Max value
+        let deadline = "000000005f5e1000"; // Replace with actual future timestamp
+        let v = "1c"; // Example value for v (27 or 28, or 0 or 1 for EIP-155)
+        let r = "0000000000000000000000000000000000000000000000000000000000000000"; // Some bytes representing r-field
+        let s = "0000000000000000000000000000000000000000000000000000000000000000"; // Some bytes representing s-field
+
+        let permit_data = format!(
+            "0x{}{}{}{}{}{}{}{}",
+            method_signature, owner, spender, value, deadline, v, r, s
+        );
+        let transaction = EvmTransactionObject {
+            from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
+            // On OZ ERC20 tokens, the permit method is used instead of approve
+            to: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
+            data: Some(permit_data),
             value: Some("0".to_string()),
             gas: None,
         };

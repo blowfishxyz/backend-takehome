@@ -24,6 +24,8 @@ pub enum ERC20Method {
 	Allowance,
 	/// Allows `spender` to withdraw from your account multiple times, up to the `value` amount. If this function is called again it overwrites the current allowance with `value`.
 	Approve,
+	/// The more 'modern' approve: doesn't require the caller to send transaction on behalf of the owner.
+	Permit,
 	/// Returns the account balance of another account with address `owner`.
 	BalanceOf,
 	/// Returns the total token supply.
@@ -47,6 +49,7 @@ impl TryFrom<ERC20Method> for [u8; 4] {
 			ERC20Method::TotalSupply => Ok([0x18, 0x16, 0x0d, 0xdd]),
 			ERC20Method::Transfer => Ok([0xa9, 0x05, 0x9c, 0xbb]),
 			ERC20Method::TransferFrom => Ok([0x23, 0xb8, 0x72, 0xdd]),
+			ERC20Method::Permit => Ok([0xd5, 0xe0, 0x8e, 0x95]),
 			ERC20Method::Unidentified => Err(ERC20Error::UnexpectedType),
 		}
 	}
@@ -74,6 +77,7 @@ impl From<Vec<u8>> for ERC20Method {
 				Self::TotalSupply => Self::TotalSupply.try_into().unwrap(),
 				Self::Transfer => Self::Transfer.try_into().unwrap(),
 				Self::TransferFrom => Self::TransferFrom.try_into().unwrap(),
+				Self::Permit => Self::Permit.try_into().unwrap(),
 			};
 			for (key, value) in method_encoding {
 				if data.starts_with(&value) {
