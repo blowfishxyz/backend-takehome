@@ -85,8 +85,7 @@ async fn check_erc20_maximum_allowance(data_bytes: &[u8]) -> anyhow::Result<Opti
 
     match erc20_method {
         ERC20Method::Approve if data_bytes.len() >= 36 => {
-            // Approve method signature is 4 bytes, spender is 20 bytes, value is 32 bytes
-            // Therefore, use byterange 36 to 68
+            // Approve method signature is 4 bytes, spender is 20 bytes (left padded 12 bytes), value is 32 bytes
             let approved_amount = &data_bytes[36..68];
             let max_allowance = [255u8; 32];
 
@@ -96,9 +95,8 @@ async fn check_erc20_maximum_allowance(data_bytes: &[u8]) -> anyhow::Result<Opti
             }
         },
         ERC20Method::Permit if data_bytes.len() >= 100 => {
-            // Permit method signature is 4 bytes, owner is 20 bytes, spender is 20 bytes, value is 32 bytes
-            // Therefore, use byterange 44 to 76
-            let approved_amount = &data_bytes[44..76];
+            // Permit method signature is 4 bytes, owner is 20 bytes (left padded 12 bytes), spender is 20 bytes (left padded 12 bytes), value is 32 bytes, deadline is 32 bytes
+            let approved_amount = &data_bytes[68..100];
             let max_allowance = [255u8; 32];
 
             if approved_amount == &max_allowance[..] {
@@ -308,8 +306,8 @@ mod tests {
     async fn it_should_warn_if_max_allowance_given_permit() -> anyhow::Result<()> {
         // Works for permit
         let method_signature = "d5e08e95"; // permit method signature
-        let owner = "6b175474e89094c44da98b954eedeac495271d0f";
-        let spender = "d8da6bf26964af9d7eed9e03e53415d37aa96045";
+        let owner = "0000000000000000000000006b175474e89094c44da98b954eedeac495271d0f";
+        let spender = "000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045";
         let value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; // Max value
         let deadline = "000000005f5e1000"; // Replace with actual future timestamp
         let v = "1c"; // Example value for v (27 or 28, or 0 or 1 for EIP-155)
