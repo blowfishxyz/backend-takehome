@@ -33,26 +33,37 @@ impl EvmTransactionChecker for Erc20TransferChecker {
 
         let transaction = _context.transaction;
         
+        // Input checks on transaction object
+        if transaction.data.is_none() || transaction.to.is_none() || transaction.from.is_none() {
+            return Ok(result);
+        }
+        
         // Parse the EVM transaction object once
         let data_bytes = hex::decode(transaction.data.as_ref().context("Transaction data is missing")?)
             .context("Failed to decode transaction data from hexadecimal")?;
         let to_address_bytes = H160::from_str(transaction.to.as_ref().context("To address is missing")?)
             .context("Failed to parse to_address to H160")?;
-        let from_address_bytes = H160::from_str(transaction.from.as_ref().context("From address is missing")?)
-            .context("Failed to parse from_address to H160")?;
 
         // Run the checks in parallel
         let checks = vec![
             check_erc20_maximum_allowance(&data_bytes).boxed(),
             check_erc20_transfer_to_token_contract(&data_bytes, to_address_bytes).boxed(),
-            check_for_scam_addresses(from_address_bytes, &data_bytes).boxed(),
+            check_for_scam_addresses(&data_bytes).boxed(),
+            check_burn(&data_bytes).boxed(),
         ];
 
         let warnings = join_all(checks).await;
         
-        for warning in warnings.into_iter().filter_map(Result::ok) {
-            if let Some(warning_message) = warning {
-                result.warnings.push(warning_message);
+        for warning_result in warnings {
+            match warning_result {
+                Ok(warning) => {
+                    if let Some(warning_message) = warning {
+                        result.warnings.push(warning_message);
+                    }
+                },
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Error while running checks: {}", e));
+                }
             }
         }
         
@@ -122,11 +133,58 @@ async fn check_erc20_transfer_to_token_contract(data_bytes: &Vec<u8>, to_address
         return Ok(Some(warning));
     }
 
+    /* TODO: Add checks against any other non-ERC223 supporting tokens */
+
+    Ok(None)
+}
+
+/// If the method call is a transfer function and the destination address is a zero address, 
+/// it generates a warning indicating tokens may not be transferred as expected.
+async fn check_burn(data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
+    if data_bytes.len() < 4 {
+        return Ok(None);
+    }
+    
+    let method = &data_bytes[0..4];
+    let method_vec = method.to_vec();
+    let erc20_method = ERC20Method::from(method_vec);
+
+    match erc20_method {
+        ERC20Method::Transfer => {
+            if data_bytes.len() < 36 {
+                return Ok(None);
+            }
+
+            // Transfer method signature is 4 bytes, to address is 20 bytes, value is 32 bytes
+            // Therefore, use byterange 4 to 24 to get the to address
+            let to_address = &data_bytes[4..24];
+            let zero_address = [0u8; 20];
+
+            if to_address == &zero_address[..] {
+                let warning = "Warning: Transfer called with a zero address as the destination. Tokens may not be transferred as expected.".to_string();
+                return Ok(Some(warning));
+            }
+        },
+        ERC20Method::TransferFrom => {
+            // TransferFrom method signature is 4 bytes, from address is 20 bytes, to address is 20 bytes, value is 32 bytes
+            // Therefore, use byterange 36 to 68 to get the from address
+            let from_address = &data_bytes[36..68];
+            let zero_address = [0u8; 32];
+
+            if from_address == &zero_address[..] {
+                let warning = "Warning: TransferFrom called with a zero address as the source. Tokens may not be transferred as expected.".to_string();
+                return Ok(Some(warning));
+            }
+        },
+        _ => {}
+    }
+
     Ok(None)
 }
 
 /// Checks if the argument of any potentially balance-altering functions is a known scam address and generates a warning if it is.
-async fn check_for_scam_addresses(from: H160, data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
+/// Scam addresses are typically contracts that will not allow you to withdraw your funds. 
+async fn check_for_scam_addresses(data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
     // TODO: Perhaps cache this in the future via. constructor
     let known_scam_addresses = vec![
         "d8da6bf26964af9d7eed9e03e53415d37aa96045", // Example scam address
@@ -141,10 +199,8 @@ async fn check_for_scam_addresses(from: H160, data_bytes: &Vec<u8>) -> anyhow::R
 
     match erc20_method {
         ERC20Method::Transfer | ERC20Method::Approve => {
-            if data_bytes.len() < 36 {
-                return Ok(None);
-            }
-
+            // Transfer method signature is 4 bytes, to address is 20 bytes (32 bytes total, 0 padded to the right), value is 32 bytes
+            // Same with approve
             let to_address = &data_bytes[16..36];
             let to_address_str = hex::encode(to_address);
 
@@ -154,16 +210,13 @@ async fn check_for_scam_addresses(from: H160, data_bytes: &Vec<u8>) -> anyhow::R
             }
         },
         ERC20Method::TransferFrom => {
-            if data_bytes.len() < 68 {
-                return Ok(None);
-            }
+            // TransferFrom method signature is 4 bytes, from address is 20 bytes, to address is 20 bytes, value is 32 bytes
+            let padded_to_address = &data_bytes[36..68];
+            let to_address = &padded_to_address[12..32]; // last 20 bytes of the 32-byte segment
+            let to_address_str = hex::encode(to_address);
 
-            let from_address = &data_bytes[36..68];
-            let from_address_str = hex::encode(from_address);
-            let from_address_h160 = H160::from_str(&from_address_str).context("Failed to parse from_address to H160")?;
-
-            if from_address_h160 == from {
-                let warning = format!("Warning: The source address {} is a known scam address. Proceed with caution.", from_address_str);
+            if known_scam_addresses.contains(&to_address_str.to_lowercase().as_str()) {
+                let warning = format!("Warning: The destination address {} is a known scam address. Proceed with caution.", to_address_str);
                 return Ok(Some(warning));
             }
         },
@@ -203,10 +256,15 @@ mod tests {
     #[tokio::test]
     async fn it_should_warn_when_erc20_transfer() -> anyhow::Result<()> {
         // Vitalik attempts to unwrap WETH by sending WETH to the contract (sample case, can work with other listed tokens)
+        let method_id = "a9059cbb"; // ERC20 transfer method ID
+        let recipient = "000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045"; // 32 bytes recipient address
+        let amount = "0000000000000000000000000000000000000000000000000000000000000001"; // 32 bytes amount (1 token, for simplicity)
+        let data = format!("0x{}{}{}", method_id, recipient, amount); // Constructing the data field explicitly
+
         let transaction = EvmTransactionObject {
             from: Some("0xd8da6bf26964af9d7eed9e03e53415d37aa96045".to_string()),
             to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()),
-            data: Some("0xa9059cbb000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa9604501".to_string()), // Emulates an ERC20 transfer call
+            data: Some(data),
             value: Some("0".to_string()),
             gas: None,
         };
@@ -223,10 +281,15 @@ mod tests {
     #[tokio::test]
     async fn it_should_warn_if_max_allowance_given_approve() -> anyhow::Result<()> {
         // Works for approve
+        let method_id = "095ea7b3"; // ERC20 approve method ID
+        let spender = "0000000000000000000000006b175474e89094c44da98b954eedeac495271d0f"; // 32 bytes spender address
+        let amount = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; // 32 bytes amount (max value)
+        let data = format!("0x{}{}{}", method_id, spender, amount); // Constructing the data field explicitly
+
         let transaction = EvmTransactionObject {
             from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
             to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()),
-            data: Some("0x095ea7b30000000000000000000000006b175474e89094c44da98b954eedeac495271d0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()),
+            data: Some(data),
             value: Some("0".to_string()),
             gas: None,
         };
@@ -277,15 +340,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn it_should_warn_if_scam_address() -> anyhow::Result<()> {
+    async fn it_should_warn_if_scam_address_approve() -> anyhow::Result<()> {
         // Example transaction representing an ERC20 `approve` method call
         // where the spender is a known scam address
+        let method_signature = "095ea7b3"; // approve method signature
+        let spender = "d8da6bf26964af9d7eed9e03e53415d37aa96045"; // Known scam address
+        let value = "0000000000000000000000000000000000000000000000000000000000000011"; // Example value
+        // Constructing the data more explicitly
+        let data = format!(
+            "0x{}000000000000000000000000{}{}",
+            method_signature, spender, value
+        );
+
         let transaction = EvmTransactionObject {
             from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
             to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()), // Address of the ERC20 token contract
-            data: Some(
-                "0x095ea7b3000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000000000000000000000000000000000000011"
-                    .to_string()),
+            data: Some(data),
             value: Some("0".to_string()),
             gas: None,
         };
@@ -297,6 +367,132 @@ mod tests {
         let result = checker.run(&context).await?;
         
         assert!(!result.warnings.is_empty(), "warning on ERC20 approve to scam address");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_should_warn_if_transfer_to_scam_address() -> anyhow::Result<()> {
+        // Example transaction representing an ERC20 `transfer` method call
+        // where the recipient is a known scam address
+        let method_signature = "a9059cbb"; // transfer method signature
+        let recipient = "d8da6bf26964af9d7eed9e03e53415d37aa96045"; // Known scam address
+        let value = "0000000000000000000000000000000000000000000000000000000000000011"; // Example value
+        // Constructing the data more explicitly
+        let data = format!(
+            "0x{}000000000000000000000000{}{}",
+            method_signature, recipient, value
+        );
+
+        let transaction = EvmTransactionObject {
+            from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
+            to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()), // Address of the ERC20 token contract
+            data: Some(data),
+            value: Some("0".to_string()),
+            gas: None,
+        };
+        
+        let context = EvmTransactionCheckerContext {
+            transaction: &transaction,
+        };
+        let checker = Erc20TransferChecker {};
+        let result = checker.run(&context).await?;
+        
+        assert!(!result.warnings.is_empty(), "warning on ERC20 transfer to scam address");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_should_warn_if_transfer_from_to_scam_address() -> anyhow::Result<()> {
+        // Example transaction representing an ERC20 `transferFrom` method call
+        // where the recipient is a known scam address
+        let method_signature = "23b872dd"; // transferFrom method signature
+        let source = "6b175474e89094c44da98b954eedeac495271d0f"; // Known source address
+        let recipient = "d8da6bf26964af9d7eed9e03e53415d37aa96045"; // Known scam address
+        let value = "0000000000000000000000000000000000000000000000000000000000000011"; // Example value
+        // Constructing the data more explicitly
+        let data = format!(
+            "0x{}000000000000000000000000{}000000000000000000000000{}{}",
+            method_signature, source, recipient, value
+        );
+
+        let transaction = EvmTransactionObject {
+            from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
+            to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()), // Address of the ERC20 token contract
+            data: Some(data),
+            value: Some("0".to_string()),
+            gas: None,
+        };
+        
+        let context = EvmTransactionCheckerContext {
+            transaction: &transaction,
+        };
+        let checker = Erc20TransferChecker {};
+        let result = checker.run(&context).await?;
+        
+        assert!(!result.warnings.is_empty(), "warning on ERC20 transferFrom to scam address");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_should_warn_if_transfer_to_zero_address() -> anyhow::Result<()> {
+        // Example transaction representing an ERC20 `transfer` method call
+        // where the recipient is a zero address
+        let method_signature = "a9059cbb"; // transfer method signature
+        let recipient = "0000000000000000000000000000000000000000"; // Zero address
+        let value = "0000000000000000000000000000000000000000000000000000000000000011"; // Example value
+        // Constructing the data more explicitly
+        let data = format!(
+            "0x{}000000000000000000000000{}{}",
+            method_signature, recipient, value
+        );
+
+        let transaction = EvmTransactionObject {
+            from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
+            to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()), // Address of the ERC20 token contract
+            data: Some(data),
+            value: Some("0".to_string()),
+            gas: None,
+        };
+        
+        let context = EvmTransactionCheckerContext {
+            transaction: &transaction,
+        };
+        let checker = Erc20TransferChecker {};
+        let result = checker.run(&context).await?;
+        
+        assert!(!result.warnings.is_empty(), "warning on ERC20 transfer to zero address");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_should_warn_if_transfer_from_to_zero_address() -> anyhow::Result<()> {
+        // Example transaction representing an ERC20 `transferFrom` method call
+        // where the recipient is a zero address
+        let method_signature = "23b872dd"; // transferFrom method signature
+        let source = "d8da6bf26964af9d7eed9e03e53415d37aa96045"; // Known scam address
+        let recipient = "0000000000000000000000000000000000000000"; // Zero address
+        let value = "0000000000000000000000000000000000000000000000000000000000000011"; // Example value
+        // Constructing the data more explicitly
+        let data = format!(
+            "0x{}000000000000000000000000{}000000000000000000000000{}{}",
+            method_signature, source, recipient, value
+        );
+
+        let transaction = EvmTransactionObject {
+            from: Some("0x6b175474e89094c44da98b954eedeac495271d0f".to_string()),
+            to: Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string()), // Address of the ERC20 token contract
+            data: Some(data),
+            value: Some("0".to_string()),
+            gas: None,
+        };
+        
+        let context = EvmTransactionCheckerContext {
+            transaction: &transaction,
+        };
+        let checker = Erc20TransferChecker {};
+        let result = checker.run(&context).await?;
+        
+        assert!(!result.warnings.is_empty(), "warning on ERC20 transferFrom to zero address");
         Ok(())
     }
 }
