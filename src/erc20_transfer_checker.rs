@@ -14,6 +14,7 @@ use ethers::types::H160;
 use std::str::FromStr;
 use anyhow::Context;
 use ethers::utils::hex;
+use futures::future::{FutureExt, join_all};
 
 /// Erc20TransferChecker is used to check if a transaction is a likely safe ERC20 transfer.
 pub struct Erc20TransferChecker {}
@@ -32,38 +33,36 @@ impl EvmTransactionChecker for Erc20TransferChecker {
 
         let transaction = _context.transaction;
         
-        // Parse the EVM transaction object
-        let data = transaction.data.as_ref()
-            .context("Transaction data is missing")?;
-        let to_address = transaction.to.as_ref()
-            .context("To address is missing")?;
-        let from_address = transaction.from.as_ref()
-            .context("From address is missing")?;
+        // Parse the EVM transaction object once
+        let data_bytes = hex::decode(transaction.data.as_ref().context("Transaction data is missing")?)
+            .context("Failed to decode transaction data from hexadecimal")?;
+        let to_address_bytes = H160::from_str(transaction.to.as_ref().context("To address is missing")?)
+            .context("Failed to parse to_address to H160")?;
+        let from_address_bytes = H160::from_str(transaction.from.as_ref().context("From address is missing")?)
+            .context("Failed to parse from_address to H160")?;
 
-        let warnings = [
-            check_erc20_transfer_to_token_contract(data, to_address),
-            check_erc20_maximum_allowance(data),
-            check_for_scam_addresses(from_address, data),
+        // Run the checks in parallel
+        let checks = vec![
+            check_erc20_maximum_allowance(&data_bytes).boxed(),
+            check_erc20_transfer_to_token_contract(&data_bytes, to_address_bytes).boxed(),
+            check_for_scam_addresses(from_address_bytes, &data_bytes).boxed(),
         ];
 
-        for warning in warnings {
-            match warning {
-                Ok(Some(warning)) => result.warnings.push(warning),
-                Ok(None) => (),
-                Err(e) => return Err(e),
+        let warnings = join_all(checks).await;
+        
+        for warning in warnings.into_iter().filter_map(Result::ok) {
+            if let Some(warning_message) = warning {
+                result.warnings.push(warning_message);
             }
         }
-
+        
         Ok(result)
     }
 }
 
 /// If the method call is an `Approve` or `Permit` and the approved amount is maximum (2^256 - 1),
 /// it generates a warning indicating that the spender can withdraw any amount at any time.
-fn check_erc20_maximum_allowance(data: &str) -> anyhow::Result<Option<String>> {
-    let data_bytes = hex::decode(data)
-        .context("Failed to decode transaction data from hexadecimal")?;
-
+async fn check_erc20_maximum_allowance(data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
     // Assume for now that empty data objects (eth_send) are not ERC20 transfers and therefore don't endanger ERC assets
     if data_bytes.len() < 4 {
         return Ok(None);
@@ -106,13 +105,7 @@ fn check_erc20_maximum_allowance(data: &str) -> anyhow::Result<Option<String>> {
 
 /// If the method call is a `Transfer` and the destination address is identified as a token contract address
 /// (not an EOA), it generates a warning indicating tokens may be lost forever (e.g. in contracts like WETH)
-fn check_erc20_transfer_to_token_contract(data: &str, to_address: &str) -> anyhow::Result<Option<String>> {
-    let to_address_bytes = H160::from_str(to_address)
-        .context("Failed to parse to_address to H160")?;
-
-    let data_bytes = hex::decode(data)
-        .context("Failed to decode transaction data from hexadecimal")?;
-
+async fn check_erc20_transfer_to_token_contract(data_bytes: &Vec<u8>, to_address_bytes: H160) -> anyhow::Result<Option<String>> {
     // Assume for now that empty data objects (eth_send) are not ERC20 transfers and therefore don't endanger ERC assets
     if data_bytes.len() < 4 {
         return Ok(None);
@@ -135,15 +128,10 @@ fn check_erc20_transfer_to_token_contract(data: &str, to_address: &str) -> anyho
 }
 
 /// Checks if the argument of any potentially balance-altering functions is a known scam address and generates a warning if it is.
-fn check_for_scam_addresses(from: &str, data: &str) -> anyhow::Result<Option<String>> {
+async fn check_for_scam_addresses(from: H160, data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
     let known_scam_addresses = vec![
         "d8da6bf26964af9d7eed9e03e53415d37aa96045", // Example scam address
     ];
-
-    println!("data: {}", data);
-
-    let data_bytes = hex::decode(data)
-        .context("Failed to decode transaction data from hexadecimal")?;
     
     if data_bytes.len() < 36 {
         return Ok(None);
@@ -173,8 +161,9 @@ fn check_for_scam_addresses(from: &str, data: &str) -> anyhow::Result<Option<Str
 
     let from_address = &data_bytes[36..68];
     let from_address_str = hex::encode(from_address);
+    let from_address_h160 = H160::from_str(&from_address_str).context("Failed to parse from_address to H160")?;
 
-    if &from_address_str == from {
+    if from_address_h160 == from {
         let warning = format!("Warning: The source address {} is a known scam address. Proceed with caution.", from_address_str);
         return Ok(Some(warning));
     }
