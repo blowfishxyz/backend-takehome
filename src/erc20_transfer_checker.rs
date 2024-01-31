@@ -62,7 +62,7 @@ impl EvmTransactionChecker for Erc20TransferChecker {
 
 /// If the method call is an `Approve` or `Permit` and the approved amount is maximum (2^256 - 1),
 /// it generates a warning indicating that the spender can withdraw any amount at any time.
-async fn check_erc20_maximum_allowance(data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
+async fn check_erc20_maximum_allowance(data_bytes: &[u8]) -> anyhow::Result<Option<String>> {
     // Assume for now that empty data objects (eth_send) are not ERC20 transfers and therefore don't endanger ERC assets
     if data_bytes.len() < 4 {
         return Ok(None);
@@ -70,35 +70,33 @@ async fn check_erc20_maximum_allowance(data_bytes: &Vec<u8>) -> anyhow::Result<O
 
     // Assume for now that the method is the first 4 bytes of the data
     let method = &data_bytes[0..4];
-    let method_vec = method.to_vec();
-    let erc20_method = ERC20Method::from(method_vec);
+    let erc20_method = ERC20Method::from(method.to_vec());
 
-    if erc20_method == ERC20Method::Approve && data_bytes.len() >= 36 {
-        // Approve method signature is 4 bytes, spender is 20 bytes, value is 32 bytes
-        // Therefore, use byterange 36 to 68
-        let approved_amount = &data_bytes[36..68];
-        let max_allowance = [255u8; 32];
+    match erc20_method {
+        ERC20Method::Approve if data_bytes.len() >= 36 => {
+            // Approve method signature is 4 bytes, spender is 20 bytes, value is 32 bytes
+            // Therefore, use byterange 36 to 68
+            let approved_amount = &data_bytes[36..68];
+            let max_allowance = [255u8; 32];
 
-        if approved_amount == &max_allowance[..] {
-            let warning = "ERC20 maximum allowance given. The spender can withdraw any amount at any time.".to_string();
-            return Ok(Some(warning));
-        }
+            if approved_amount == &max_allowance[..] {
+                let warning = "ERC20 maximum allowance given. The spender can withdraw any amount at any time.".to_string();
+                return Ok(Some(warning));
+            }
+        },
+        ERC20Method::Permit if data_bytes.len() >= 100 => {
+            // Permit method signature is 4 bytes, owner is 20 bytes, spender is 20 bytes, value is 32 bytes
+            // Therefore, use byterange 44 to 76
+            let approved_amount = &data_bytes[44..76];
+            let max_allowance = [255u8; 32];
+
+            if approved_amount == &max_allowance[..] {
+                let warning = "ERC20 maximum allowance given via Permit. The spender can withdraw any amount at any time.".to_string();
+                return Ok(Some(warning));
+            }
+        },
+        _ => {}
     }
-
-    if erc20_method == ERC20Method::Permit && data_bytes.len() >= 100 {
-        // Permit method signature is 4 bytes, owner is 20 bytes, spender is 20 bytes, value is 32 bytes
-        // Therefore, use byterange 44 to 76
-        let approved_amount = &data_bytes[44..76];
-        let max_allowance = [255u8; 32];
-
-        println!("approved_amount: {:?}", approved_amount);
-        println!("max_allowance: {:?}", max_allowance);
-    
-        if approved_amount == &max_allowance[..] {
-            let warning = "ERC20 maximum allowance given via Permit. The spender can withdraw any amount at any time.".to_string();
-            return Ok(Some(warning));
-        }
-    }    
 
     Ok(None)
 }
@@ -129,43 +127,47 @@ async fn check_erc20_transfer_to_token_contract(data_bytes: &Vec<u8>, to_address
 
 /// Checks if the argument of any potentially balance-altering functions is a known scam address and generates a warning if it is.
 async fn check_for_scam_addresses(from: H160, data_bytes: &Vec<u8>) -> anyhow::Result<Option<String>> {
+    // TODO: Perhaps cache this in the future via. constructor
     let known_scam_addresses = vec![
         "d8da6bf26964af9d7eed9e03e53415d37aa96045", // Example scam address
     ];
     
-    if data_bytes.len() < 36 {
+    if data_bytes.len() < 4 {
         return Ok(None);
     }
 
     let method = &data_bytes[0..4];
-    let method_vec = method.to_vec();
-    let erc20_method = ERC20Method::from(method_vec);
+    let erc20_method = ERC20Method::from(method.to_vec());
 
-    // Handle case: ERC20 transfer // approve, to_address from bytes 16 to 36
-    if erc20_method != ERC20Method::Transfer && erc20_method != ERC20Method::Approve {
-        return Ok(None);
-    }
+    match erc20_method {
+        ERC20Method::Transfer | ERC20Method::Approve => {
+            if data_bytes.len() < 36 {
+                return Ok(None);
+            }
 
-    let to_address = &data_bytes[16..36];
-    let to_address_str = hex::encode(to_address);
+            let to_address = &data_bytes[16..36];
+            let to_address_str = hex::encode(to_address);
 
-    if known_scam_addresses.contains(&to_address_str.to_lowercase().as_str()) {
-        let warning = format!("Warning: The destination address {} is a known scam address. Proceed with caution.", to_address_str);
-        return Ok(Some(warning));
-    }
+            if known_scam_addresses.contains(&to_address_str.to_lowercase().as_str()) {
+                let warning = format!("Warning: The destination address {} is a known scam address. Proceed with caution.", to_address_str);
+                return Ok(Some(warning));
+            }
+        },
+        ERC20Method::TransferFrom => {
+            if data_bytes.len() < 68 {
+                return Ok(None);
+            }
 
-    // Handle case: ERC20 transferFrom, from_address from bytes 36 to 68
-    if erc20_method != ERC20Method::TransferFrom {
-        return Ok(None);
-    }
+            let from_address = &data_bytes[36..68];
+            let from_address_str = hex::encode(from_address);
+            let from_address_h160 = H160::from_str(&from_address_str).context("Failed to parse from_address to H160")?;
 
-    let from_address = &data_bytes[36..68];
-    let from_address_str = hex::encode(from_address);
-    let from_address_h160 = H160::from_str(&from_address_str).context("Failed to parse from_address to H160")?;
-
-    if from_address_h160 == from {
-        let warning = format!("Warning: The source address {} is a known scam address. Proceed with caution.", from_address_str);
-        return Ok(Some(warning));
+            if from_address_h160 == from {
+                let warning = format!("Warning: The source address {} is a known scam address. Proceed with caution.", from_address_str);
+                return Ok(Some(warning));
+            }
+        },
+        _ => (),
     }
 
     Ok(None)
