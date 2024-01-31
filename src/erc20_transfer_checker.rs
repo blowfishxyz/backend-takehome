@@ -32,44 +32,48 @@ impl EvmTransactionChecker for Erc20TransferChecker {
 
         let transaction = _context.transaction;
         
+        // Parse the EVM transaction object
         let data = transaction.data.as_ref()
             .context("Transaction data is missing")?;
         let to_address = transaction.to.as_ref()
             .context("To address is missing")?;
 
-        let to_address_bytes = H160::from_str(to_address)
-            .context("Failed to parse to_address to H160")?;
-
-        let data_bytes = hex::decode(data)
-            .context("Failed to decode transaction data from hexadecimal")?;
-
-        // Return ok for now if no transfer data
-        if data.len() < 4 {
-            return Ok(result);
+        if let Some(warning) = check_erc20_transfer_to_token_contract(data, to_address)? {
+            result.warnings.push(warning);
         }
-        let method = &data[0..4];
 
-        println!("Method: {:?}", method);
-
-        let method = &data_bytes[0..4];
-        let method_vec = method.to_vec();
-        let erc20_method = ERC20Method::from(method_vec);
-        let contract_address = ContractAddress::from(to_address_bytes);
-
-        println!("ERC20 method: {:?}", erc20_method);
-        println!("Contract address: {:?}", contract_address);
-
-        if erc20_method == ERC20Method::Transfer && contract_address != ContractAddress::Unidentified(to_address_bytes) {
-            result.warnings.push(format!(
-                "ERC20 transfer to contract address {:?}",
-                contract_address
-            ));
-        }
-        
-        // Check if the tx gives ERC20 approval to a proxy contract
-        println!("Result: {:?}", result);
         Ok(result)
     }
+}
+
+/// If the method call is a `Transfer` and the destination address is identified as a contract address
+/// (not an EOA), it generates a warning indicating tokens may be lost forever (e.g. in contracts like WETH)
+fn check_erc20_transfer_to_token_contract(data: &str, to_address: &str) -> anyhow::Result<Option<String>> {
+    let to_address_bytes = H160::from_str(to_address)
+        .context("Failed to parse to_address to H160")?;
+
+    let data_bytes = hex::decode(data)
+        .context("Failed to decode transaction data from hexadecimal")?;
+
+    // Assume for now that empty data objects (eth_send) are not ERC20 transfers and therefore don't endanger ERC assets
+    if data_bytes.len() < 4 {
+        return Ok(None);
+    }
+
+    let method = &data_bytes[0..4];
+    let method_vec = method.to_vec();
+    let erc20_method = ERC20Method::from(method_vec);
+    let contract_address = ContractAddress::from(to_address_bytes);
+
+    if erc20_method == ERC20Method::Transfer && contract_address != ContractAddress::Unidentified(to_address_bytes) {
+        let warning = format!(
+            "ERC20 transfer to contract address {:?}",
+            contract_address
+        );
+        return Ok(Some(warning));
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
